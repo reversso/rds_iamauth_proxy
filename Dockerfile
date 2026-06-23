@@ -1,6 +1,6 @@
-FROM clux/muslrust:1.85.0-stable AS chef
+FROM clux/muslrust:1.88.0-stable AS chef
 USER root
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 FROM chef AS planner
@@ -18,4 +18,4 @@ FROM alpine:3.21 AS runtime
 RUN addgroup -S rdsproxy && adduser -S rdsproxy -G rdsproxy
 COPY --from=builder /rds_proxy /usr/local/bin/
 USER rdsproxy
-CMD ["/usr/local/bin/rds_proxy", "--config", "/etc/rds_proxy/config.json", "--listen", "0.0.0.0:5435"]
+CMD ["/usr/local/bin/rds_proxy", "--listen", "0.0.0.0:5435"]

@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate serde_derive;
-
 use std::net::SocketAddr;
 
 use byteorder::BigEndian;
@@ -8,8 +5,6 @@ use byteorder::ByteOrder;
 use bytes::Bytes;
 use clap::arg;
 use clap::Command;
-use config::Config;
-use config::File;
 use eyre::{eyre, Result};
 use futures::SinkExt;
 use memchr::memchr;
@@ -177,14 +172,6 @@ async fn run_proxy(config: BackendConfig, listen_address: &str) -> Result<()> {
     }
 }
 
-fn load_config(config_file: &str) -> Result<BackendConfig> {
-    let s = Config::builder()
-        .add_source(File::with_name(config_file))
-        .build()?;
-
-    s.try_deserialize().map_err(|e| e.into())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     setup()?;
@@ -192,21 +179,20 @@ async fn main() -> Result<()> {
     let matches = Command::new("rds_proxy")
         .version("1.0")
         .author("Greg Soltis <greg@goldfiglabs.com")
-        .arg(arg!(-c --config <CONFIG> "Sets the proxy config file to use").default_value("proxy"))
-        .arg(
-            arg!(-l --listen <LISTEN> "Sets the address to listen on")
-                .default_value("127.0.0.1:5435"),
-        )
+        .arg(arg!(-l --listen <LISTEN> "Sets the address to listen on"))
         .get_matches();
 
-    let config_file = matches.get_one::<String>("config").unwrap();
-    let listen_address = matches.get_one::<String>("listen").unwrap();
+    let listen_address = matches
+        .get_one::<String>("listen")
+        .cloned()
+        .or_else(|| std::env::var("LISTEN_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:5435".to_owned());
 
-    let backend_config = load_config(config_file)?;
+    let backend_config = BackendConfig::from_env()?;
 
     // Run the proxy until we either get a Ctrl-C event or the proxy fails
     tokio::select! {
-        _ = run_proxy(backend_config, listen_address) => {}
+        _ = run_proxy(backend_config, &listen_address) => {}
         _ = signal::ctrl_c() => {}
     }
 

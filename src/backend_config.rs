@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use aws_config::BehaviorVersion;
@@ -20,6 +23,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_postgres::tls::TlsConnect;
 use tokio_stream::StreamExt;
 use tokio_util::codec::BytesCodec;
@@ -46,7 +50,7 @@ impl DbSpec {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Addr {
     hostname: String,
     port: u16,
@@ -58,31 +62,94 @@ impl Addr {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct BackendConfig {
     endpoint: Addr,
-    region: String,
-    proxy_endpoint: Option<Addr>,
+    connect_endpoint: Addr,
+    password_cache_ttl: Duration,
+    password_cache: Arc<Mutex<PasswordCache>>,
 }
 
 impl BackendConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_vars(std::env::vars())
+    }
+
+    fn from_vars<I, K, V>(vars: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars: HashMap<String, String> = vars
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+
+        let db_host = required_var(&vars, "DB_HOST")?;
+        let db_port = parse_port(&vars, "DB_PORT", 5432)?;
+        let password_cache_ttl = parse_duration_secs(
+            &vars,
+            "PASSWORD_CACHE_TTL_SECS",
+            DEFAULT_PASSWORD_CACHE_TTL_SECS,
+        )?;
+        let connect_host = vars
+            .get("CONNECT_HOST")
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| db_host.clone());
+        let connect_port = parse_port(&vars, "CONNECT_PORT", db_port)?;
+
+        Ok(BackendConfig {
+            endpoint: Addr {
+                hostname: db_host,
+                port: db_port,
+            },
+            connect_endpoint: Addr {
+                hostname: connect_host,
+                port: connect_port,
+            },
+            password_cache_ttl,
+            password_cache: Arc::new(Mutex::new(PasswordCache::default())),
+        })
+    }
+
     fn connect_endpoint(&self) -> &Addr {
-        match self.proxy_endpoint {
-            Some(ref proxy) => proxy,
-            None => &self.endpoint,
-        }
+        &self.connect_endpoint
     }
 
     pub async fn get_server_conn(&self, db_spec: DbSpec) -> Result<TlsStream<TcpStream>> {
+        let password = self.get_password(db_spec.user.as_str()).await?;
+        let stream = self.backend_conn(db_spec, password).await?;
+        Ok(stream)
+    }
+
+    async fn get_password(&self, username: &str) -> Result<String> {
+        let key = PasswordCacheKey {
+            hostname: self.endpoint.hostname.clone(),
+            port: self.endpoint.port,
+            username: username.to_owned(),
+        };
+
+        let now = Instant::now();
+        if let Some(password) = self.password_cache.lock().await.get(&key, now) {
+            return Ok(password);
+        }
+
         let password = get_rds_password(
             self.endpoint.hostname.as_ref(),
             self.endpoint.port,
-            self.region.as_ref(),
-            db_spec.user.as_str(),
+            username,
         )
         .await?;
-        let stream = self.backend_conn(db_spec, password).await?;
-        Ok(stream)
+
+        self.password_cache.lock().await.insert(
+            key,
+            password.clone(),
+            Instant::now() + self.password_cache_ttl,
+        );
+
+        Ok(password)
     }
 
     async fn backend_conn(
@@ -118,15 +185,85 @@ impl BackendConfig {
     }
 }
 
+const DEFAULT_PASSWORD_CACHE_TTL_SECS: u64 = 10 * 60;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PasswordCacheKey {
+    hostname: String,
+    port: u16,
+    username: String,
+}
+
+#[derive(Clone, Debug)]
+struct PasswordCacheEntry {
+    password: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PasswordCache {
+    passwords: HashMap<PasswordCacheKey, PasswordCacheEntry>,
+}
+
+impl PasswordCache {
+    fn get(&mut self, key: &PasswordCacheKey, now: Instant) -> Option<String> {
+        match self.passwords.get(key) {
+            Some(entry) if entry.expires_at > now => Some(entry.password.clone()),
+            Some(_) => {
+                self.passwords.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn insert(&mut self, key: PasswordCacheKey, password: String, expires_at: Instant) {
+        self.passwords.insert(
+            key,
+            PasswordCacheEntry {
+                password,
+                expires_at,
+            },
+        );
+    }
+}
+
+fn required_var(vars: &HashMap<String, String>, name: &str) -> Result<String> {
+    vars.get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| eyre!("missing required environment variable {name}"))
+}
+
+fn parse_port(vars: &HashMap<String, String>, name: &str, default: u16) -> Result<u16> {
+    match vars.get(name).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| eyre!("{name} must be a valid TCP port, got {value:?}")),
+        None => Ok(default),
+    }
+}
+
+fn parse_duration_secs(
+    vars: &HashMap<String, String>,
+    name: &str,
+    default: u64,
+) -> Result<Duration> {
+    match vars.get(name).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<u64>().map(Duration::from_secs).map_err(|_| {
+            eyre!("{name} must be a non-negative integer number of seconds, got {value:?}")
+        }),
+        None => Ok(Duration::from_secs(default)),
+    }
+}
+
 const HTTPS_LEN: usize = "https://".len();
 
-pub async fn get_rds_password(
-    rds_host: &str,
-    port: u16,
-    region_name: &str,
-    username: &str,
-) -> Result<String> {
+pub async fn get_rds_password(rds_host: &str, port: u16, username: &str) -> Result<String> {
     let config = aws_config::load_defaults(BehaviorVersion::v2023_11_09()).await;
+    let region = config
+        .region()
+        .ok_or_else(|| eyre!("AWS region not resolved; set AWS_REGION or AWS_DEFAULT_REGION"))?;
     let provider = config
         .credentials_provider()
         .ok_or(eyre!("no credentials provider found"))?;
@@ -139,7 +276,7 @@ pub async fn get_rds_password(
 
     let signing_params = v4::SigningParams::builder()
         .identity(&identity)
-        .region(region_name)
+        .region(region.as_ref())
         .name("rds-db")
         .time(SystemTime::now())
         .settings(signing_settings)
@@ -183,5 +320,131 @@ where
         }
     } else {
         Err(eyre!("Unexpected backed message"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_requires_db_host() {
+        let err = BackendConfig::from_vars([] as [(&str, &str); 0]).unwrap_err();
+        assert!(err.to_string().contains("DB_HOST"));
+    }
+
+    #[test]
+    fn config_defaults_ports_and_connect_endpoint() {
+        let config = BackendConfig::from_vars([("DB_HOST", "db.example.com")]).unwrap();
+
+        assert_eq!(
+            config.endpoint,
+            Addr {
+                hostname: "db.example.com".to_owned(),
+                port: 5432,
+            }
+        );
+        assert_eq!(
+            config.connect_endpoint,
+            Addr {
+                hostname: "db.example.com".to_owned(),
+                port: 5432,
+            }
+        );
+        assert_eq!(
+            config.password_cache_ttl,
+            Duration::from_secs(DEFAULT_PASSWORD_CACHE_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn config_allows_connect_endpoint_override() {
+        let config = BackendConfig::from_vars([
+            ("DB_HOST", "db.example.com"),
+            ("DB_PORT", "5433"),
+            ("CONNECT_HOST", "localhost"),
+            ("CONNECT_PORT", "15432"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.endpoint,
+            Addr {
+                hostname: "db.example.com".to_owned(),
+                port: 5433,
+            }
+        );
+        assert_eq!(
+            config.connect_endpoint,
+            Addr {
+                hostname: "localhost".to_owned(),
+                port: 15432,
+            }
+        );
+    }
+
+    #[test]
+    fn config_allows_password_cache_ttl_override() {
+        let config = BackendConfig::from_vars([
+            ("DB_HOST", "db.example.com"),
+            ("PASSWORD_CACHE_TTL_SECS", "30"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.password_cache_ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn config_rejects_invalid_password_cache_ttl() {
+        let err = BackendConfig::from_vars([
+            ("DB_HOST", "db.example.com"),
+            ("PASSWORD_CACHE_TTL_SECS", "nope"),
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("PASSWORD_CACHE_TTL_SECS"));
+    }
+
+    #[test]
+    fn config_rejects_invalid_ports() {
+        let err = BackendConfig::from_vars([("DB_HOST", "db.example.com"), ("DB_PORT", "nope")])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("DB_PORT"));
+    }
+
+    #[test]
+    fn password_cache_returns_unexpired_password() {
+        let mut cache = PasswordCache::default();
+        let key = PasswordCacheKey {
+            hostname: "db.example.com".to_owned(),
+            port: 5432,
+            username: "db_user".to_owned(),
+        };
+        let now = Instant::now();
+
+        cache.insert(
+            key.clone(),
+            "password".to_owned(),
+            now + Duration::from_secs(DEFAULT_PASSWORD_CACHE_TTL_SECS),
+        );
+
+        assert_eq!(cache.get(&key, now), Some("password".to_owned()));
+    }
+
+    #[test]
+    fn password_cache_evicts_expired_password() {
+        let mut cache = PasswordCache::default();
+        let key = PasswordCacheKey {
+            hostname: "db.example.com".to_owned(),
+            port: 5432,
+            username: "db_user".to_owned(),
+        };
+        let now = Instant::now();
+
+        cache.insert(key.clone(), "password".to_owned(), now);
+
+        assert_eq!(cache.get(&key, now + Duration::from_secs(1)), None);
+        assert!(cache.passwords.is_empty());
     }
 }
